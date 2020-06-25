@@ -7417,7 +7417,7 @@ class TestTorchDeviceType(TestCase):
     @skipCUDAIfNoMagma
     @skipCPUIfNoLapack
     @dtypes(torch.float, torch.double)
-    def test_matrix_exp(self, device, dtype):
+    def test_matrix_exp_analytic(self, device, dtype):
         # check zero matrix
         x = torch.zeros(20, 20, dtype=dtype, device=device)
         self.assertTrue((x.matrix_exp() == torch.eye(20, 20, dtype=dtype, device=device)).all().item())
@@ -7426,6 +7426,11 @@ class TestTorchDeviceType(TestCase):
             sample_norm, _ = sample.abs().sum(-2).max(-1)
             sample_to_1_norm = sample / sample_norm.unsqueeze(-1).unsqueeze(-1)
             return sample_to_1_norm * desired_norm
+
+        def good_cond_number_matrices(*n):
+            x = torch.randn(*n, dtype=dtype, device=device)
+            u, _, v = torch.svd(x)
+            return torch.matmul(u, v.transpose(-1, -2))
 
         def run_test(*n):
             if dtype == torch.float:
@@ -7447,71 +7452,44 @@ class TestTorchDeviceType(TestCase):
                     1.090863719290036e+00   # deg 18
                 ]
 
+            # generate input
+            q = good_cond_number_matrices(n)
+            qinv = q.transpose(-1, -2)
+            d = torch.randn(n[:-1], dtype=dtype, device=device)
+            x = torch.matmul(q, torch.matmul(torch.diag_embed(d), qinv))
+            x_norm, _ = x.abs().sum(-2).max(-1)
+
+            # test simple analytic whatever norm generated
+            mexp = x.matrix_exp()
+            mexp_analytic = torch.matmul(
+                q,
+                torch.matmul(
+                    torch.diag_embed(d.exp()),
+                    qinv
+                )
+            )
+            self.assertEqual(mexp, mexp_analytic, atol=1e-3, rtol=0.0)
+
+
+            # generate norms to test different degree expansions
             sample_norms = []
             for i in range(len(thetas) - 1):
                 sample_norms.append(0.5 * (thetas[i] + thetas[i + 1]))
             sample_norms = [thetas[0] / 2] + sample_norms + [thetas[-1] * 2]
 
-            if len(n) <= 2:
-                # symmetric matrix test
-                for sample_norm in sample_norms:
-                    q = torch.randn(n, dtype=dtype, device=device) / n[-1]
-                    x = q @ q.t()
-                    x = normalize_to_1_operator_norm(x, sample_norm)
+            # matrices to equal norm
+            for sample_norm in sample_norms:
+                x_normalized = normalize_to_1_operator_norm(x, sample_norm)
 
-                    mexp = torch.matrix_exp(x)
-
-                    u, s, v = torch.svd(x)
-                    mexp_svd = u @ torch.diag(s.exp()) @ v.t()
-
-                    self.assertEqual(mexp, mexp_svd, atol=1e-3, rtol=0)
-
-                # generic square matrix case
-                for sample_norm in sample_norms:
-                    identity = torch.eye(n[-2], n[1], dtype=dtype, device=device).expand(n)
-                    # stabilize + improve condition number
-                    q = torch.randn(n, dtype=dtype, device=device) + identity
-                    q = normalize_to_1_operator_norm(q, 1.0)
-                    qinv = torch.inverse(q)
-                    d = torch.ones(n[-1], dtype=dtype, device=device).abs()
-                    x = q @ torch.diag(d) @ qinv
-                    x_norm, _ = x.abs().sum(-2).max(-1)
-                    x = normalize_to_1_operator_norm(x, sample_norm)
-
-                    mexp = torch.matrix_exp(x)
-                    mexp_eig = q @ torch.diag((d / x_norm * sample_norm).exp()) @ qinv
-
-                    self.assertEqual(mexp, mexp_eig, atol=1e-3, rtol=0)
-            else:
-                # batched
-
-                # symmetric matrix case
-                for sample_norm in sample_norms:
-                    q = torch.randn(n, dtype=dtype, device=device) / n[-1]
-                    x = torch.matmul(q, q.transpose(-1, -2))
-                    x = normalize_to_1_operator_norm(x, sample_norm)
-
-                    mexp = torch.matrix_exp(x)
-
-                    u, s, v = torch.svd(x)
-
-                    mexp_svd = torch.matmul(u, torch.matmul(torch.diag_embed(s.exp()), v.transpose(-1, -2)))
-
-                    self.assertEqual(mexp, mexp_svd, atol=1e-3, rtol=0)
-
-                # generic square matrix case
-                identity = torch.eye(n[-2], n[1], dtype=dtype, device=device).expand(n)
-                # stabilize + improve condition number
-                q = torch.randn(n, dtype=dtype, device=device) + identity
-                q = normalize_to_1_operator_norm(q, 1.0)
-                qinv = torch.inverse(q)
-                d = torch.ones(n[:-1], dtype=dtype, device=device).abs()
-                x = torch.matmul(q, torch.matmul(torch.diag_embed(d), qinv))
-
-                mexp = torch.matrix_exp(x)
-                mexp_eig = torch.matmul(q, torch.matmul(torch.diag_embed(d.exp()), qinv))
-
-                self.assertEqual(mexp, mexp_eig, atol=1e-3, rtol=0)
+                mexp = x_normalized.matrix_exp()
+                mexp_analytic = torch.matmul(
+                    q,
+                    torch.matmul(
+                        torch.diag_embed((d / x_norm.unsqueeze(-1) * sample_norm).exp()),
+                        qinv
+                    )
+                )
+                self.assertEqual(mexp, mexp_analytic, atol=1e-3, rtol=0.0)
 
         # single matrix
         run_test(2, 2)
@@ -7524,6 +7502,12 @@ class TestTorchDeviceType(TestCase):
         run_test(3, 3, 3)
         run_test(3, 4, 4)
         run_test(3, 5, 5)
+
+        # large batch of matrices
+        run_test(3, 3, 2, 2)
+        run_test(3, 3, 3, 3)
+        run_test(3, 3, 4, 4)
+        run_test(3, 3, 5, 5)
 
     @skipCUDAIfNoMagma
     @skipCPUIfNoLapack
